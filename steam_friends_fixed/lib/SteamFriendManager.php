@@ -12,13 +12,14 @@ declare(strict_types=1);
  *      сервер ставит Set-Cookie steamLoginSecure=<JWT для community> в ответе.
  *      Эту cookie используем как community-сессию (синтетический "<sid>||<jwt>"
  *      от api.steampowered.com community.com не принимает — другая audience).
- *   3. Один раз парсим data-userinfo на /my/ → short_url ("https://s.team/p/<encoded>")
- *      — персональный префикс quick-invite ссылки A.
- *   4. На каждой паре (A → B):
+ *   3. На каждой паре (A → B):
  *        a) A POST https://steamcommunity.com/invites/ajaxcreate
  *           body: sessionid, steamid_user=<A>, duration=2592000
- *           → одноразовый invite_token.
- *        b) B (логинится из $allAccounts) GET <A.short_url>/<invite_token>
+ *           → одноразовый invite_token + готовая полная ссылка invite_link
+ *           вида "https://s.team/p/<short>/<token>".
+ *           Если по какой-то причине Steam отдал только токен — short_url
+ *           тянется со страницы /friends/add (там JS его эмбеддит).
+ *        b) B (логинится из $allAccounts) GET <invite_link>
  *           под своими community-cookies. s.team редиректит на /user/<short>/<token>/,
  *           Steam серверно регистрирует обоюдную дружбу A↔B и сжигает токен.
  *        c) Финальный URL после редиректов разбираем:
@@ -505,7 +506,7 @@ class SteamFriendManager
             'session'  => $session,
             'proxy'    => $proxy,
             'token'    => $auth['token'],
-            'short_url'=> '', // ленивая загрузка в apiFetchOwnShortUrl
+            'short_url'=> '', // ленивая загрузка только если invite_link не отдаётся
         ];
         if ($loginSid !== '') $this->sessionCache[$loginSid] = $entry;
         if ($sid !== '' && $sid !== $loginSid) $this->sessionCache[$sid] = $entry;
@@ -555,21 +556,10 @@ class SteamFriendManager
         $loginSid = $A['session']['steamid'] ?: $ownSid;
         if ($onProgress) $onProgress("✅ {$login}: залогинен (steamId={$loginSid})");
 
-        // Прогрев — short_url у A нужен для всех redeem'ов.
-        try {
-            $A['short_url'] = $this->apiFetchOwnShortUrl($A['session'], $A['proxy']);
-            if ($A['short_url'] === '') {
-                throw new RuntimeException('apiFetchOwnShortUrl: пустой short_url (cookie не принят community)');
-            }
-            // обновляем кэш
-            $this->sessionCache[$loginSid] = $A;
-            if ($ownSid !== '' && $ownSid !== $loginSid) $this->sessionCache[$ownSid] = $A;
-        } catch (Throwable $e) {
-            $msg = $this->shortError($e->getMessage());
-            $results['errors'][] = ['target' => '*', 'error' => "short_url_failed: {$msg}"];
-            $this->log("addFriends {$login} steamId={$loginSid}: short_url_failed: {$msg}");
-            return $results;
-        }
+        // short_url у A не нужен заранее — invites/ajaxcreate сам отдаёт
+        // готовый invite_link. short_url используется только как резерв,
+        // если Steam отдал лишь invite_token без полной ссылки (он же
+        // парсится со страницы /friends/add, не с /my/).
 
         // Друзья A — чтобы не тратить запрос на already_friends.
         $friendSet = [];
@@ -621,32 +611,46 @@ class SteamFriendManager
      * и переходит по https://s.team/p/<short>/<token>; Steam серверно
      * регистрирует обоюдную дружбу. Возвращает финальный статус.
      */
-    private function addOnePair(array $A, string $targetSid, array $byId, string $logLogin): string
+    private function addOnePair(array &$A, string $targetSid, array $byId, string $logLogin): string
     {
         if (!isset($byId[$targetSid])) {
             return 'no_account_for_target';
         }
 
-        // 1. mint
-        $token = '';
+        // 1. mint — получаем либо готовую ссылку, либо токен.
+        $invite = ['link' => '', 'token' => ''];
         try {
-            $token = $this->apiCreateInviteToken($A['session'], $A['proxy']);
+            $invite = $this->apiCreateInviteToken($A['session'], $A['proxy']);
         } catch (Throwable $e) {
             $msg = $this->shortError($e->getMessage());
             $this->log("addFriends {$logLogin} → {$targetSid}: create_invite_failed: {$msg}");
             return 'create_invite_failed:' . $msg;
         }
 
-        // 2. login B (с кэшированием)
+        // 2. собираем редемпшн URL. Приоритет — готовый invite_link от Steam.
+        $redeemUrl = $invite['link'];
+        if ($redeemUrl === '') {
+            if ($invite['token'] === '') return 'no_invite_link_or_token';
+            // Резерв: short_url со страницы /friends/add. Кэшируем в $A.
+            if (empty($A['short_url'])) {
+                $A['short_url'] = $this->apiFetchShortUrlFromFriendsAdd($A['session'], $A['proxy']);
+                $loginSid = $A['session']['steamid'] ?? '';
+                if ($loginSid !== '') $this->sessionCache[$loginSid] = $A;
+            }
+            if (empty($A['short_url'])) return 'no_short_url_for_token';
+            $redeemUrl = rtrim($A['short_url'], '/') . '/' . $invite['token'];
+        }
+
+        // 3. login B (с кэшированием)
         try {
             $B = $this->ensureAccountSession($byId[$targetSid]);
         } catch (Throwable $e) {
             return 'b_login_failed:' . $this->shortError($e->getMessage());
         }
 
-        // 3. redeem
+        // 4. redeem
         return $this->apiRedeemQuickInvite(
-            $B['session'], $A['short_url'], $token, $A['session']['steamid'], $B['proxy']
+            $B['session'], $redeemUrl, $A['session']['steamid'], $B['proxy']
         );
     }
 
@@ -659,27 +663,26 @@ class SteamFriendManager
     }
 
     /**
-     * GET https://steamcommunity.com/my/ → парсим data-userinfo → short_url.
-     * short_url имеет вид "https://s.team/p/<encoded>" — персональный префикс
-     * quick-invite ссылки. Возвращает '' если не получилось (тогда логически
-     * cookie-сессия не валидна для community).
+     * Резерв: парсим short_url со страницы /friends/add (там JS, рендерящий
+     * кнопку «Создать ссылку», эмбеддит full URL вида
+     * "https://s.team/p/<short>" в data-* / в JS-объекте).
+     * Возвращает '' если не нашли (тогда положимся только на invite_link
+     * из ответа invites/ajaxcreate).
      */
-    private function apiFetchOwnShortUrl(array $session, ?array $proxy): string
+    private function apiFetchShortUrlFromFriendsAdd(array $session, ?array $proxy): string
     {
-        $url = 'https://steamcommunity.com/my/';
+        $url = 'https://steamcommunity.com/profiles/' . $session['steamid'] . '/friends/add';
         $cookie = $this->communityCookieHeader($session);
         $finalCode = 0;
         $finalUrl  = $url;
-        $finalBody = '';
-
-        // /my/ может редиректить 2-3 раза: /my/ → /profiles/<sid>/ или /id/<vanity>/
+        $body = '';
         for ($i = 0; $i < 5; $i++) {
             $resp = $this->httpRequest('GET', $finalUrl, null, $proxy, [
                 'Accept: text/html,application/xhtml+xml,*/*',
                 'Cookie: ' . $cookie,
             ]);
             $finalCode = $resp['code'];
-            $finalBody = $resp['body'];
+            $body = $resp['body'];
             if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
                 $loc = $resp['headers']['location'];
                 if ($loc[0] === '/') $loc = 'https://steamcommunity.com' . $loc;
@@ -688,41 +691,31 @@ class SteamFriendManager
             }
             break;
         }
-
-        // Если в финале мы на /login/, значит cookie не принята.
-        $isLogin = str_contains($finalUrl, '/login/');
-        $hasUserInfo = false;
         $shortUrl = '';
-
-        if (!$isLogin && $finalCode === 200 && $finalBody !== '') {
-            if (preg_match('/data-userinfo="([^"]+)"/', $finalBody, $m)) {
-                $hasUserInfo = true;
-                $json = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
-                $info = json_decode($json, true);
-                if (is_array($info) && !empty($info['short_url'])) {
-                    $shortUrl = (string)$info['short_url'];
-                }
-            }
+        if ($finalCode === 200 && $body !== ''
+            && preg_match('#https://s\.team/p/[a-z0-9\-]+#i', $body, $m)) {
+            $shortUrl = $m[0];
         }
-
         $this->log(sprintf(
-            'apiFetchOwnShortUrl: final HTTP %d url=%s isLogin=%d hasUserInfo=%d shortUrl=%s',
+            'apiFetchShortUrlFromFriendsAdd: HTTP %d url=%s shortUrl=%s',
             $finalCode,
             preg_replace('#^https?://#', '', $finalUrl),
-            $isLogin ? 1 : 0,
-            $hasUserInfo ? 1 : 0,
             $shortUrl !== '' ? '<set>' : '<empty>'
         ));
-
         return $shortUrl;
     }
 
     /**
      * POST https://steamcommunity.com/invites/ajaxcreate
      *   body: sessionid, steamid_user=<own>, duration=2592000
-     *   resp: {"success":1,"data":{"invite":{"invite_token":"<секрет>"}}}
+     *   Steam отдаёт примерно:
+     *     {"success":true,"invite":["<token>"],"invite_duration":[2592000],
+     *      "invite_link":["https://s.team/p/<short>/<token>"]}
+     *   (имена и формы могут варьироваться: invite_token / invite / invite_link / invite_url).
+     *
+     * Возвращает ['link' => '<полный URL>' либо '', 'token' => '<token>' либо ''].
      */
-    private function apiCreateInviteToken(array $session, ?array $proxy): string
+    private function apiCreateInviteToken(array $session, ?array $proxy): array
     {
         $body = http_build_query([
             'sessionid'    => $session['sessionid'],
@@ -750,14 +743,41 @@ class SteamFriendManager
             // Если cookie невалидна — возвращается HTML login-страницы.
             throw new RuntimeException('non-JSON (HTTP ' . $resp['code'] . ')');
         }
-        $tok = $data['data']['invite']['invite_token']
+
+        // Достаём токен из всех известных мест.
+        $token = $data['invite_token']
+            ?? $data['data']['invite']['invite_token']
             ?? $data['invite']['invite_token']
             ?? '';
-        if (!is_string($tok) || $tok === '') {
-            $err = (string)($data['error'] ?? $data['msg'] ?? 'no invite_token');
-            throw new RuntimeException($err);
+        if (is_array($token)) $token = $token[0] ?? '';
+        if (!is_string($token)) $token = '';
+
+        // Иногда массив 'invite' сам содержит токен (например, "invite":["xxxx"]).
+        if ($token === '' && isset($data['invite']) && is_array($data['invite'])) {
+            $first = reset($data['invite']);
+            if (is_string($first) && $first !== '') $token = $first;
         }
-        return $tok;
+
+        // Полная ссылка вида https://s.team/p/<short>/<token> может прийти под
+        // разными именами и тоже как массив.
+        $candidates = [
+            $data['invite_link']  ?? null,
+            $data['invite_url']   ?? null,
+            $data['data']['invite']['invite_link'] ?? null,
+            $data['data']['invite']['invite_url']  ?? null,
+        ];
+        $link = '';
+        foreach ($candidates as $c) {
+            if (is_array($c)) $c = $c[0] ?? null;
+            if (is_string($c) && stripos($c, 's.team/p/') !== false) { $link = $c; break; }
+        }
+
+        if ($token === '' && $link === '') {
+            $err = (string)($data['error'] ?? $data['msg'] ?? json_encode($data));
+            throw new RuntimeException($this->shortError($err));
+        }
+
+        return ['link' => $link, 'token' => $token];
     }
 
     /**
@@ -773,11 +793,9 @@ class SteamFriendManager
      *   прочее                                → community_error=redeem_unknown
      */
     private function apiRedeemQuickInvite(
-        array $bSession, string $aShortUrl, string $token, string $aSteamId, ?array $proxy
+        array $bSession, string $url, string $aSteamId, ?array $proxy
     ): string {
-        if ($aShortUrl === '' || $token === '') return 'invalid_invite';
-        $url = rtrim($aShortUrl, '/') . '/' . $token;
-
+        if ($url === '') return 'invalid_invite';
         $cookie = $this->communityCookieHeader($bSession);
         $maxRedirects = 6;
         $finalUrl  = $url;
