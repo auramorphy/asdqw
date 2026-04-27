@@ -4,38 +4,40 @@ declare(strict_types=1);
 /**
  * SteamFriendManager — добавление Steam-аккаунтов чекеров в друзья друг к другу.
  *
- * Прямой режим (без quick-invite ссылок) + автоприём входящих:
- *   1. Аккаунт A логинится через Steam Auth protobuf API → access_token (JWT).
- *   2. Из access_token собирается cookie-сессия steamcommunity.com:
- *        sessionid        = случайные 24 hex
- *        steamLoginSecure = "<steamid64>||<jwt>" (URL-encoded)
- *   3. Один раз получаем у A:
- *        - текущий список друзей  (IFriendsListService/GetFriendsList/v1/)
- *        - входящие friend-заявки (HTML /profiles/<own>/friends/pending → data-steamid)
- *   4. По каждой цели B:
- *        - если уже друзья                           → already_friends, без запроса
- *        - если у A висит входящая заявка от B       → POST AddFriendAjax(B, accept_invite=1)
- *                                                      (== кнопка «Принять» в UI Steam)
- *        - иначе                                     → POST AddFriendAjax(B, accept_invite=0)
- *                                                      (== кнопка «Добавить»)
- *   5. После одного полного прогона по всем аккаунтам все пары соединяются:
- *      первый аккаунт отправляет N-1 заявок, остальные при своём проходе видят
- *      входящие заявки и принимают их.
+ * Поток через quick-invite link (s.team/p/<short>/<token>):
+ *   1. Каждый аккаунт логинится (RSA → BeginAuth → PollAuth → refresh_token + access_token).
+ *   2. POST https://login.steampowered.com/jwt/finalizelogin (с refresh_token)
+ *      → transfer_info[i] для каждого домена (store/help/checkout/community).
+ *      Для steamcommunity.com POST его {steamID/nonce/auth} на settoken-URL —
+ *      сервер ставит Set-Cookie steamLoginSecure=<JWT для community> в ответе.
+ *      Эту cookie используем как community-сессию (синтетический "<sid>||<jwt>"
+ *      от api.steampowered.com community.com не принимает — другая audience).
+ *   3. Один раз парсим data-userinfo на /my/ → short_url ("https://s.team/p/<encoded>")
+ *      — персональный префикс quick-invite ссылки A.
+ *   4. На каждой паре (A → B):
+ *        a) A POST https://steamcommunity.com/invites/ajaxcreate
+ *           body: sessionid, steamid_user=<A>, duration=2592000
+ *           → одноразовый invite_token.
+ *        b) B (логинится из $allAccounts) GET <A.short_url>/<invite_token>
+ *           под своими community-cookies. s.team редиректит на /user/<short>/<token>/,
+ *           Steam серверно регистрирует обоюдную дружбу A↔B и сжигает токен.
+ *        c) Финальный URL после редиректов разбираем:
+ *             /profiles/<A>/  или /id/<A_vanity>/  → invite_redeemed
+ *             /login/...                            → access_denied
+ *             body: expired/invalid/already         → invite_expired / invalid_invite / already_friends
  *
- * Защита от rate-limit:
- *   - 4–7 секунд паузы между каждой отправкой (accept-вызовы лимитятся слабее).
- *   - 2× rate_limited подряд → стоп для этого аккаунта в текущем запуске.
- *   - already_friends определяется по friend-list, не тратя HTTP-запрос на Steam.
+ * Quick-invite ссылка (ни сам токен, ни short_url) НИГДЕ не выводится —
+ * ни в UI/HTML, ни в логах. Существует только в памяти между шагами 4a и 4b.
  *
- * Почему не api.steampowered.com / quick-invite:
- *   - IFriendsListService/AddFriend/v1/               → HTTP 404 (Valve удалил)
- *   - IUserAccountService/CreateFriendInviteToken/v1/ → HTTP 404
- *   - IUserAccountService/RedeemFriendInviteToken/v1/ → HTTP 404
- *     (живут только в .steamclient.proto, см. https://steamapi.xpaw.me/)
- *   - quick-invite редемпшн через GET /user/<short>/<token>/ требует логина
- *     обоих аккаунтов в одном HTTP-запросе и упирался в тот же rate-limit.
- *   AddFriendAjax — это live cookie-action, тот же путь, что нажатие кнопок
- *   «Добавить» / «Принять» в самом UI Steam.
+ * Почему НЕ через AddFriendAjax / api.steampowered.com:
+ *   - api.steampowered.com IFriendsListService/AddFriend и
+ *     IUserAccountService/(Create|Redeem)FriendInviteToken на Web API не выставлены
+ *     (живут только в .steamclient.proto, см. https://steamapi.xpaw.me/).
+ *   - actions/AddFriendAjax агрессивно лимитится по IP/аккаунту:
+ *     уже после нескольких заявок Steam отвечает rate_limited на всё.
+ *   - quick-invite (invites/ajaxcreate + GET /user/<short>/<token>/) — это путь,
+ *     который Steam использует на странице /friends/add своего веб-UI;
+ *     он не упирается в тот же rate-limit, потому что это разные эндпоинты.
  *
  * Зависимости:
  *   - SteamProtobufCodec (protobuf encode/decode для login-флоу)
@@ -133,15 +135,45 @@ class SteamFriendManager
             );
         }
 
-        // Step 4. PollAuthSessionStatus → access_token
-        $accessToken = $this->pollAuthSession($clientId, $requestId, $proxy);
-        $this->log("LOGIN step4 access_token ok, len=" . strlen($accessToken));
+        // Step 4. PollAuthSessionStatus → access_token + refresh_token
+        $tokens = $this->pollAuthSessionFull($clientId, $requestId, $proxy);
+        $accessToken  = $tokens['access_token'];
+        $refreshToken = $tokens['refresh_token'];
+        $this->log("LOGIN step4 tokens ok, access_len=" . strlen($accessToken)
+                 . " refresh_len=" . strlen($refreshToken));
 
-        if (!$accessToken) {
-            throw new RuntimeException('Не получен access_token из PollAuthSession');
+        if ($refreshToken === '') {
+            throw new RuntimeException('Не получен refresh_token из PollAuthSession');
         }
 
-        return ['token' => $accessToken, 'steamId' => $steamId];
+        // Step 5. finalizelogin (refresh_token → transfer_info)
+        // + settoken на steamcommunity.com (transfer_info → server-issued steamLoginSecure cookie).
+        // Только так Steam примет нашу cookie-сессию на community.com (синтетический
+        // "<sid>||<jwt>" не работает — там JWT с другой audience).
+        $sid = bin2hex(random_bytes(12));
+        try {
+            $transferInfo = $this->finalizeLogin($refreshToken, $sid, $proxy);
+            $sls = $this->acquireSteamLoginSecure(
+                $steamId, $transferInfo, 'steamcommunity.com', $proxy
+            );
+            $this->log("LOGIN step5 community steamLoginSecure ok, len=" . strlen($sls));
+        } catch (Throwable $e) {
+            // Если settoken упал — quick-invite flow не сработает. Бросаем ошибку явно,
+            // чтобы add_one не делал бесполезных запросов в community с битой сессией.
+            throw new RuntimeException('finalizelogin/settoken: ' . $this->shortError($e->getMessage()));
+        }
+
+        return [
+            'token'         => $accessToken,
+            'refresh_token' => $refreshToken,
+            'steamId'       => $steamId,
+            // готовая cookie-сессия для steamcommunity.com (server-issued)
+            'community_session' => [
+                'sessionid'          => $sid,
+                'steam_login_secure' => $sls,
+                'steamid'            => $steamId,
+            ],
+        ];
     }
 
     // =========================================================================
@@ -251,16 +283,18 @@ class SteamFriendManager
     }
 
     /**
-     * Step 4: PollAuthSessionStatus — получаем access_token.
+     * Step 4: PollAuthSessionStatus — получаем оба токена.
      *
      * Ответ PollAuthSessionStatus содержит:
-     *   field 3 = refresh_token (нужен для cookies/finalizeLogin)
-     *   field 4 = access_token  (нужен для Steam Web API)
+     *   field 3 = refresh_token (нужен для finalizelogin → cookie steamcommunity.com)
+     *   field 4 = access_token  (нужен для api.steampowered.com / IFriendsListService)
      *
-     * SteamStoreSession берёт refresh_token (field 3) для обмена на cookies.
-     * Нам нужен access_token (field 4) для IFriendsListService.
+     * Возвращаем оба. Если field 4 пуст — генерируем access из refresh
+     * через GenerateAccessTokenForApp.
+     *
+     * @return array{access_token: string, refresh_token: string}
      */
-    private function pollAuthSession(int $clientId, string $requestId, ?array $proxy): string
+    private function pollAuthSessionFull(int $clientId, string $requestId, ?array $proxy): array
     {
         $proto  = SteamProtobufCodec::encodeVarint(1, $clientId);
         $proto .= SteamProtobufCodec::encodeString(2, $requestId);
@@ -279,30 +313,21 @@ class SteamFriendManager
             }
 
             $decoded = SteamProtobufCodec::decode($resp['body']);
-            // field 3 = refresh_token, field 4 = access_token
             $refreshToken = isset($decoded[3]) && is_string($decoded[3]) ? $decoded[3] : '';
             $accessToken  = isset($decoded[4]) && is_string($decoded[4]) ? $decoded[4] : '';
 
-            if ($accessToken !== '') {
-                $this->log("PollAuth: got access_token len=" . strlen($accessToken)
-                         . " refresh_token len=" . strlen($refreshToken));
-                return $accessToken;
-            }
-
-            // Если refresh есть, а access нет — генерируем access через GenerateAccessTokenForApp
             if ($refreshToken !== '') {
-                $this->log("PollAuth: got refresh_token but no access_token, trying GenerateAccessTokenForApp");
-                $generated = $this->generateAccessTokenFromRefresh($refreshToken, $proxy);
-                if ($generated) return $generated;
-                // Если не получилось — используем refresh как fallback (маловероятно, что сработает)
-                $this->log("PollAuth: GenerateAccessTokenForApp failed, using refresh_token as fallback");
-                return $refreshToken;
+                if ($accessToken === '') {
+                    $this->log("PollAuth: got refresh_token but no access_token, generating");
+                    $accessToken = (string)$this->generateAccessTokenFromRefresh($refreshToken, $proxy);
+                }
+                return ['access_token' => $accessToken, 'refresh_token' => $refreshToken];
             }
 
             usleep($delayMs * 1000);
         }
 
-        throw new RuntimeException('PollAuth: за ' . ($maxAttempts * $delayMs / 1000) . 'с не получен token');
+        throw new RuntimeException('PollAuth: за ' . ($maxAttempts * $delayMs / 1000) . 'с не получен refresh_token');
     }
 
     /**
@@ -335,50 +360,150 @@ class SteamFriendManager
         return null;
     }
 
+    /**
+     * Step 5a: POST https://login.steampowered.com/jwt/finalizelogin
+     *   multipart: nonce=<refresh_token>, sessionid=<sid>, redir=https://store.steampowered.com/login/
+     * Возвращает массив transfer_info: для каждого домена (store/checkout/help/community)
+     * свой URL + nonce/auth, которые надо POST'нуть на этот URL чтобы получить
+     * Set-Cookie steamLoginSecure от самого сервера домена.
+     *
+     * @return array<int, array{url: string, nonce: string, auth: string}>
+     */
+    private function finalizeLogin(string $refreshToken, string $sessionId, ?array $proxy): array
+    {
+        $boundary = '----PHP' . bin2hex(random_bytes(8));
+        $body = '';
+        foreach ([
+            'nonce'     => $refreshToken,
+            'sessionid' => $sessionId,
+            'redir'     => 'https://store.steampowered.com/login/',
+        ] as $k => $v) {
+            $body .= "--{$boundary}\r\n";
+            $body .= "Content-Disposition: form-data; name=\"{$k}\"\r\n\r\n";
+            $body .= $v . "\r\n";
+        }
+        $body .= "--{$boundary}--\r\n";
+
+        $resp = $this->httpRequest('POST', 'https://login.steampowered.com/jwt/finalizelogin', $body, $proxy, [
+            'Accept: application/json, text/plain, */*',
+            'Content-Type: multipart/form-data; boundary=' . $boundary,
+            'Origin: https://store.steampowered.com',
+            'Referer: https://store.steampowered.com/',
+        ]);
+        if ($resp['code'] < 200 || $resp['code'] >= 300) {
+            throw new RuntimeException("finalizelogin: HTTP {$resp['code']}");
+        }
+        $data = json_decode($resp['body'] ?: '', true);
+        if (!is_array($data) || empty($data['transfer_info']) || !is_array($data['transfer_info'])) {
+            throw new RuntimeException('finalizelogin: нет transfer_info в ответе');
+        }
+        $out = [];
+        foreach ($data['transfer_info'] as $ti) {
+            $url    = (string)($ti['url'] ?? '');
+            $params = $ti['params'] ?? [];
+            if ($url === '' || !is_array($params)) continue;
+            $out[] = [
+                'url'   => $url,
+                'nonce' => (string)($params['nonce'] ?? ''),
+                'auth'  => (string)($params['auth'] ?? ''),
+            ];
+        }
+        if (!$out) throw new RuntimeException('finalizelogin: transfer_info пуст после разбора');
+        return $out;
+    }
+
+    /**
+     * Step 5b: POST на нужный transfer_info URL (например, https://steamcommunity.com/login/settoken)
+     *   form-urlencoded: steamID=<sid>, nonce=<...>, auth=<...>
+     * Steam в ответ ставит Set-Cookie steamLoginSecure=<jwt> для своего домена.
+     * Возвращаем значение этой cookie (URL-encoded форма для прямого использования
+     * в Cookie заголовке).
+     */
+    private function acquireSteamLoginSecure(
+        string $steamId, array $transferInfo, string $domainContains, ?array $proxy
+    ): string {
+        foreach ($transferInfo as $t) {
+            if (stripos($t['url'], $domainContains) === false) continue;
+
+            $body = http_build_query([
+                'steamID' => $steamId,
+                'nonce'   => $t['nonce'],
+                'auth'    => $t['auth'],
+            ]);
+            $resp = $this->httpRequest('POST', $t['url'], $body, $proxy, [
+                'Accept: application/json',
+                'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+                'Origin: https://store.steampowered.com',
+                'Referer: https://store.steampowered.com/',
+            ]);
+            if ($resp['code'] < 200 || $resp['code'] >= 300) {
+                throw new RuntimeException("settoken {$domainContains}: HTTP {$resp['code']}");
+            }
+            $cookies = $resp['headers']['set-cookie'] ?? [];
+            if (!is_array($cookies)) $cookies = [$cookies];
+            foreach ($cookies as $c) {
+                if (preg_match('/^steamLoginSecure=([^;]+)/i', $c, $m)) {
+                    return $m[1]; // уже URL-encoded — кладём как есть в Cookie header
+                }
+            }
+            throw new RuntimeException("settoken {$domainContains}: нет steamLoginSecure в Set-Cookie");
+        }
+        throw new RuntimeException("finalizelogin: нет transfer_info для {$domainContains}");
+    }
+
     // =========================================================================
-    // Добавление в друзья: прямой AddFriendAjax + автоприём входящих заявок
+    // Добавление в друзья: quick-invite link s.team/p/<short>/<token>
     // =========================================================================
 
     /**
-     * Кэш cookie-сессии аккаунта внутри одного add_one запроса:
-     *   steamid64 → ['session' => [...], 'proxy' => array|null, 'token' => string]
-     * Чтобы не логиниться повторно, если по какой-то причине вызовут несколько раз.
+     * Кэш живой cookie-сессии и short_url аккаунта внутри одного add_one запроса.
+     *   steamid64 → [
+     *     'session' => ['sessionid','steam_login_secure','steamid'],
+     *     'proxy'   => ?array,
+     *     'token'   => string (access_token),
+     *     'short_url' => string ("https://s.team/p/<short>"), пусто пока не загружено
+     *   ]
      */
     private array $sessionCache = [];
 
-    /** Залогиниться и собрать cookie-сессию. */
+    /**
+     * Залогиниться (через RSA + BeginAuth + PollAuth + finalizelogin + settoken)
+     * и кэшировать community cookie-сессию + access_token.
+     */
     private function ensureAccountSession(array $account): array
     {
         $sid = (string)($account['steamid64'] ?? '');
         if ($sid !== '' && isset($this->sessionCache[$sid])) {
             return $this->sessionCache[$sid];
         }
-        $auth     = $this->loginAndGetToken($account);
-        $proxy    = $this->loadProxyForAccount($account);
-        $loginSid = $auth['steamId'] ?: $sid;
-        $session  = $this->buildCommunitySession($loginSid, $auth['token']);
-        $entry    = ['session' => $session, 'proxy' => $proxy, 'token' => $auth['token']];
+        $auth      = $this->loginAndGetToken($account); // вернёт community_session
+        $proxy     = $this->loadProxyForAccount($account);
+        $loginSid  = $auth['steamId'] ?: $sid;
+        $session   = $auth['community_session'];
+        if (empty($session['steamid'])) $session['steamid'] = $loginSid;
+
+        $entry = [
+            'session'  => $session,
+            'proxy'    => $proxy,
+            'token'    => $auth['token'],
+            'short_url'=> '', // ленивая загрузка в apiFetchOwnShortUrl
+        ];
         if ($loginSid !== '') $this->sessionCache[$loginSid] = $entry;
         if ($sid !== '' && $sid !== $loginSid) $this->sessionCache[$sid] = $entry;
         return $entry;
     }
 
     /**
-     * Главная точка: для одного аккаунта (A) добавить в друзья всех target-ов.
+     * Главная точка: A создаёт quick-invite ссылку, остальные аккаунты
+     * (B из $allAccounts) погашают её серверно. На каждой паре свой
+     * одноразовый токен — после первого редемпшена он сжигается.
      *
-     * Для каждой цели B:
-     *   - если уже друзья → already_friends (без HTTP-запроса)
-     *   - если у A висит входящая заявка от B → AddFriendAjax(B, accept_invite=1) → accepted
-     *   - иначе → AddFriendAjax(B, accept_invite=0) → invite_sent / pending / …
-     *
-     * Между запросами стоят паузы 4–7 секунд против Steam-rate-limit.
-     * Если получили rate_limited подряд два раза — оставшиеся цели для этого
-     * аккаунта пропускаем со статусом rate_limited (продолжать бесполезно,
-     * следующий аккаунт-источник пройдёт нормально, и пара всё равно склеится).
+     * Ссылка нигде не отдаётся наружу — ни в UI/HTML, ни в логах.
+     * В логах остаются только короткие статусы.
      *
      * @param array       $account     Строка steam_checker_accounts (источник, A)
      * @param string[]    $targetSteamIds steamid64 всех целей
-     * @param array       $allAccounts (не используется в прямом режиме, оставлено для совместимости)
+     * @param array       $allAccounts Все строки steam_checker_accounts (для логина B)
      * @param callable|null $onProgress function(string $message)
      */
     public function addFriendsFromAccount(
@@ -387,10 +512,17 @@ class SteamFriendManager
         array $allAccounts = [],
         ?callable $onProgress = null
     ): array {
-        unset($allAccounts); // не нужно в прямом режиме (B не логинится)
         $results = ['sent' => [], 'errors' => []];
         $login   = $account['login'] ?? '?';
         $ownSid  = (string)($account['steamid64'] ?? '');
+
+        // карта steamid64 → строка аккаунта (для логина B)
+        $byId = [];
+        foreach ($allAccounts as $a) {
+            $sid = (string)($a['steamid64'] ?? '');
+            if ($sid !== '') $byId[$sid] = $a;
+        }
+        if ($ownSid !== '' && !isset($byId[$ownSid])) $byId[$ownSid] = $account;
 
         // login A
         try {
@@ -404,33 +536,35 @@ class SteamFriendManager
         $loginSid = $A['session']['steamid'] ?: $ownSid;
         if ($onProgress) $onProgress("✅ {$login}: залогинен (steamId={$loginSid})");
 
-        // Текущий список друзей A — чтобы не тратить запрос на already_friends.
+        // Прогрев — short_url у A нужен для всех redeem'ов.
+        try {
+            $A['short_url'] = $this->apiFetchOwnShortUrl($A['session'], $A['proxy']);
+            if ($A['short_url'] === '') {
+                throw new RuntimeException('apiFetchOwnShortUrl: пустой short_url (cookie не принят community)');
+            }
+            // обновляем кэш
+            $this->sessionCache[$loginSid] = $A;
+            if ($ownSid !== '' && $ownSid !== $loginSid) $this->sessionCache[$ownSid] = $A;
+        } catch (Throwable $e) {
+            $msg = $this->shortError($e->getMessage());
+            $results['errors'][] = ['target' => '*', 'error' => "short_url_failed: {$msg}"];
+            $this->log("addFriends {$login} steamId={$loginSid}: short_url_failed: {$msg}");
+            return $results;
+        }
+
+        // Друзья A — чтобы не тратить запрос на already_friends.
         $friendSet = [];
         try {
             $friendSet = $this->fetchFriendSetByToken($A['token']);
-            if ($onProgress) $onProgress("  · уже друзей: " . count($friendSet));
         } catch (Throwable $e) {
             $this->log("addFriends {$login}: fetch_friends_failed: " . $this->shortError($e->getMessage()));
         }
-
-        // Входящие заявки A — кого надо «принять» вместо «отправить».
-        $pendingIncoming = [];
-        try {
-            $pendingIncoming = $this->fetchPendingIncoming($A['session'], $A['proxy']);
-            if ($onProgress && $pendingIncoming) {
-                $onProgress("  · входящих заявок: " . count($pendingIncoming));
-            }
-        } catch (Throwable $e) {
-            $this->log("addFriends {$login}: fetch_pending_failed: " . $this->shortError($e->getMessage()));
-        }
-
-        $consecutiveRateLimit = 0;
 
         foreach ($targetSteamIds as $targetSid) {
             $targetSid = (string)$targetSid;
             if ($targetSid === '' || $targetSid === $loginSid || $targetSid === $ownSid) continue;
 
-            // 1. Уже друзья — пропускаем без запроса.
+            // already friends → ничего не шлём в Steam
             if (isset($friendSet[$targetSid])) {
                 $results['sent'][] = ['target' => $targetSid, 'result' => 'already_friends'];
                 $this->log("addFriends {$login} → {$targetSid}: already_friends (cached)");
@@ -438,64 +572,225 @@ class SteamFriendManager
                 continue;
             }
 
-            // 2. Висит входящая заявка от B → принимаем.
-            // 3. Иначе → отправляем.
-            $accept = isset($pendingIncoming[$targetSid]) ? 1 : 0;
-
             try {
-                $status = $this->apiAddFriendCommunity($A['session'], $targetSid, $A['proxy'], $accept);
+                $status = $this->addOnePair($A, $targetSid, $byId, $login);
             } catch (Throwable $e) {
                 $status = 'failed:' . $this->shortError($e->getMessage());
             }
 
-            // переименовываем для accept-режима, чтобы UI понимал смысл
-            if ($accept === 1 && in_array($status, ['invite_sent', 'pending'], true)) {
-                $status = 'accepted';
-            }
-
-            $isOk = in_array($status, ['invite_sent', 'accepted', 'already_friends', 'pending'], true);
+            $isOk = in_array($status, ['invite_redeemed', 'already_friends'], true);
             if ($isOk) {
                 $results['sent'][] = ['target' => $targetSid, 'result' => $status];
                 $this->log("addFriends {$login} → {$targetSid}: {$status}");
                 if ($onProgress) $onProgress("  ✓ {$targetSid}: {$status}");
-                $consecutiveRateLimit = 0;
             } else {
                 $results['errors'][] = ['target' => $targetSid, 'error' => $status];
                 $this->log("addFriends {$login} → {$targetSid}: {$status}");
                 if ($onProgress) $onProgress("  ✕ {$targetSid}: {$status}");
-
-                if ($status === 'rate_limited') {
-                    $consecutiveRateLimit++;
-                    if ($consecutiveRateLimit >= 2) {
-                        if ($onProgress) $onProgress("  ⏸ {$login}: 2× rate_limited подряд — стоп для этого аккаунта");
-                        $this->log("addFriends {$login}: stop on consecutive rate_limit");
-                        break;
-                    }
-                    // длинная пауза, чтобы Steam отпустил
-                    sleep(random_int(15, 25));
-                    continue;
-                }
-                $consecutiveRateLimit = 0;
             }
 
-            // Базовая пауза между AddFriendAjax — 4–7 сек.
-            // Для accept (входящая заявка) — короче, она почти не лимитится.
-            if ($accept === 1) usleep(random_int(800_000, 1_500_000));
-            else                sleep(random_int(4, 7));
+            // Пауза между парами — короткая, поскольку invites/ajaxcreate
+            // и /user/<short>/<token>/ слабо лимитятся (это не AddFriendAjax).
+            usleep(random_int(800_000, 1_500_000));
         }
 
         return $results;
     }
 
     /**
-     * Список друзей A (только steamid64) через access_token A.
-     * Возвращает map sid → true для быстрой проверки.
+     * Один полный шаг A→B: A создаёт одноразовый invite_token, B логинится
+     * и переходит по https://s.team/p/<short>/<token>; Steam серверно
+     * регистрирует обоюдную дружбу. Возвращает финальный статус.
+     */
+    private function addOnePair(array $A, string $targetSid, array $byId, string $logLogin): string
+    {
+        if (!isset($byId[$targetSid])) {
+            return 'no_account_for_target';
+        }
+
+        // 1. mint
+        $token = '';
+        try {
+            $token = $this->apiCreateInviteToken($A['session'], $A['proxy']);
+        } catch (Throwable $e) {
+            $msg = $this->shortError($e->getMessage());
+            $this->log("addFriends {$logLogin} → {$targetSid}: create_invite_failed: {$msg}");
+            return 'create_invite_failed:' . $msg;
+        }
+
+        // 2. login B (с кэшированием)
+        try {
+            $B = $this->ensureAccountSession($byId[$targetSid]);
+        } catch (Throwable $e) {
+            return 'b_login_failed:' . $this->shortError($e->getMessage());
+        }
+
+        // 3. redeem
+        return $this->apiRedeemQuickInvite(
+            $B['session'], $A['short_url'], $token, $A['session']['steamid'], $B['proxy']
+        );
+    }
+
+    /** Cookie-заголовок для steamcommunity.com. */
+    private function communityCookieHeader(array $session): string
+    {
+        // steam_login_secure уже хранится URL-encoded (как поставил Set-Cookie от Steam).
+        return 'sessionid=' . $session['sessionid']
+             . '; steamLoginSecure=' . $session['steam_login_secure'];
+    }
+
+    /**
+     * GET https://steamcommunity.com/my/ → парсим data-userinfo → short_url.
+     * short_url имеет вид "https://s.team/p/<encoded>" — персональный префикс
+     * quick-invite ссылки. Возвращает '' если не получилось (тогда логически
+     * cookie-сессия не валидна для community).
+     */
+    private function apiFetchOwnShortUrl(array $session, ?array $proxy): string
+    {
+        $resp = $this->httpRequest('GET', 'https://steamcommunity.com/my/', null, $proxy, [
+            'Accept: text/html,*/*',
+            'Cookie: ' . $this->communityCookieHeader($session),
+        ]);
+        // /my/ редиректит на /profiles/<id>/, нам важен любой ответ с data-userinfo
+        if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
+            $loc = $resp['headers']['location'];
+            if ($loc[0] === '/') $loc = 'https://steamcommunity.com' . $loc;
+            $resp = $this->httpRequest('GET', $loc, null, $proxy, [
+                'Accept: text/html,*/*',
+                'Cookie: ' . $this->communityCookieHeader($session),
+            ]);
+        }
+        if ($resp['code'] !== 200 || $resp['body'] === '') return '';
+
+        if (preg_match('/data-userinfo="([^"]+)"/', $resp['body'], $m)) {
+            $json = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
+            $info = json_decode($json, true);
+            if (is_array($info) && !empty($info['short_url'])) {
+                return (string)$info['short_url'];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * POST https://steamcommunity.com/invites/ajaxcreate
+     *   body: sessionid, steamid_user=<own>, duration=2592000
+     *   resp: {"success":1,"data":{"invite":{"invite_token":"<секрет>"}}}
+     */
+    private function apiCreateInviteToken(array $session, ?array $proxy): string
+    {
+        $body = http_build_query([
+            'sessionid'    => $session['sessionid'],
+            'steamid_user' => $session['steamid'],
+            'duration'     => '2592000',
+        ]);
+        $resp = $this->httpRequest('POST', 'https://steamcommunity.com/invites/ajaxcreate', $body, $proxy, [
+            'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+            'Accept: application/json, text/plain, */*',
+            'X-Requested-With: XMLHttpRequest',
+            'Origin: https://steamcommunity.com',
+            'Referer: https://steamcommunity.com/profiles/' . $session['steamid'] . '/friends/add',
+            'Cookie: ' . $this->communityCookieHeader($session),
+        ]);
+
+        if ($resp['code'] === 401 || $resp['code'] === 403) {
+            throw new RuntimeException('access_denied (HTTP ' . $resp['code'] . ')');
+        }
+        if ($resp['code'] === 429) {
+            throw new RuntimeException('rate_limited (HTTP 429)');
+        }
+
+        $data = json_decode($resp['body'] ?: '', true);
+        if (!is_array($data)) {
+            // Если cookie невалидна — возвращается HTML login-страницы.
+            throw new RuntimeException('non-JSON (HTTP ' . $resp['code'] . ')');
+        }
+        $tok = $data['data']['invite']['invite_token']
+            ?? $data['invite']['invite_token']
+            ?? '';
+        if (!is_string($tok) || $tok === '') {
+            $err = (string)($data['error'] ?? $data['msg'] ?? 'no invite_token');
+            throw new RuntimeException($err);
+        }
+        return $tok;
+    }
+
+    /**
+     * GET <short_url>/<invite_token>  (== https://s.team/p/<short>/<token>)
+     * под cookie-сессией B. s.team редиректит на /user/<short>/<token>/,
+     * Steam серверно регистрирует дружбу A↔B (одноразово), затем редиректит
+     * обычно на /profiles/<A>/ или /id/<A_vanity>/.
+     *
+     * Различаем итог по финальному URL после всех редиректов:
+     *   /profiles/<A>/ или /id/<A_vanity>/  → invite_redeemed
+     *   /login/                              → access_denied
+     *   /user/.../ + body «expired/invalid» → invite_expired / invalid_invite
+     *   прочее                                → community_error=redeem_unknown
+     */
+    private function apiRedeemQuickInvite(
+        array $bSession, string $aShortUrl, string $token, string $aSteamId, ?array $proxy
+    ): string {
+        if ($aShortUrl === '' || $token === '') return 'invalid_invite';
+        $url = rtrim($aShortUrl, '/') . '/' . $token;
+
+        $cookie = $this->communityCookieHeader($bSession);
+        $maxRedirects = 6;
+        $finalUrl  = $url;
+        $finalBody = '';
+        $finalCode = 0;
+
+        for ($i = 0; $i < $maxRedirects; $i++) {
+            $resp = $this->httpRequest('GET', $finalUrl, null, $proxy, [
+                'Accept: text/html,application/xhtml+xml,*/*',
+                'Cookie: ' . $cookie,
+            ]);
+            $finalCode = $resp['code'];
+            $finalBody = $resp['body'];
+            if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
+                $loc = $resp['headers']['location'];
+                if ($loc[0] === '/') $loc = $this->absUrl($finalUrl, $loc);
+                $finalUrl = $loc;
+                continue;
+            }
+            break;
+        }
+
+        if (str_contains($finalUrl, '/login/')) return 'access_denied';
+
+        if (preg_match('#/profiles/' . preg_quote($aSteamId, '#') . '/?#', $finalUrl)) {
+            return 'invite_redeemed';
+        }
+        if (preg_match('#/id/[^/]+/?$#', $finalUrl)) {
+            return 'invite_redeemed';
+        }
+
+        $body = strtolower($finalBody);
+        if (str_contains($body, 'expired')) return 'invite_expired';
+        if (str_contains($body, 'invalid') || str_contains($body, 'no longer valid')) return 'invalid_invite';
+        if (str_contains($body, 'already')) return 'already_friends';
+
+        if ($finalCode !== 200) return 'community_error=redeem_http_' . $finalCode;
+        return 'community_error=redeem_unknown';
+    }
+
+    private function absUrl(string $base, string $relative): string
+    {
+        if (preg_match('#^https?://#i', $relative)) return $relative;
+        $p = parse_url($base);
+        $scheme = $p['scheme'] ?? 'https';
+        $host   = $p['host']   ?? 'steamcommunity.com';
+        if ($relative[0] !== '/') $relative = '/' . $relative;
+        return $scheme . '://' . $host . $relative;
+    }
+
+    /**
+     * Список друзей A через access_token A.
+     * Возвращает map sid → true.
      */
     private function fetchFriendSetByToken(string $accessToken): array
     {
         $url = 'https://api.steampowered.com/IFriendsListService/GetFriendsList/v1/?'
              . http_build_query(['access_token' => $accessToken]);
-
         $resp = $this->httpRequest('GET', $url, null, null, [
             'Accept: application/json',
         ]);
@@ -507,7 +802,6 @@ class SteamFriendManager
                 ?? $data['response']['friends']
                 ?? $data['friendslist']['friends']
                 ?? [];
-
         $set = [];
         foreach ($friends as $f) {
             $sid = (string)($f['steamid'] ?? '');
@@ -515,142 +809,6 @@ class SteamFriendManager
         }
         return $set;
     }
-
-    /**
-     * Парсит страницу /profiles/<own>/friends/pending и возвращает map
-     * inviter_steamid64 → true для аккаунтов, у которых висит входящая
-     * заявка к A. Это позволяет принять заявку (accept_invite=1) вместо
-     * отправки новой.
-     *
-     * Steam рендерит входящие в блоках с классом `invite_row` и атрибутом
-     * data-steamid. Дополнительно ловим data-miniprofile (32-bit accountid),
-     * из которого восстанавливаем steamid64 = 76561197960265728 + accountid.
-     */
-    private function fetchPendingIncoming(array $session, ?array $proxy): array
-    {
-        $url = 'https://steamcommunity.com/profiles/' . $session['steamid'] . '/friends/pending';
-        $resp = $this->httpRequest('GET', $url, null, $proxy, [
-            'Accept: text/html,*/*',
-            'Cookie: ' . $this->communityCookieHeader($session),
-        ]);
-        // /friends/pending может ответить 302 → следуем
-        if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
-            $loc = $resp['headers']['location'];
-            if ($loc[0] === '/') $loc = 'https://steamcommunity.com' . $loc;
-            $resp = $this->httpRequest('GET', $loc, null, $proxy, [
-                'Accept: text/html,*/*',
-                'Cookie: ' . $this->communityCookieHeader($session),
-            ]);
-        }
-        if ($resp['code'] !== 200 || $resp['body'] === '') return [];
-
-        $set = [];
-        $body = $resp['body'];
-
-        // Ищем блоки только в секции «приглашают вас». Valve размечает по-разному:
-        //  - <div class="invite_row ..." data-steamid="...">
-        //  - <div class="friend_block_v2 ..." data-miniprofile="..." data-invite-actions="...">
-        if (preg_match_all('/<div[^>]+class="[^"]*invite_row[^"]*"[^>]+data-steamid="(\d+)"/i', $body, $m)) {
-            foreach ($m[1] as $sid) $set[$sid] = true;
-        }
-        if (preg_match_all(
-            '/data-miniprofile="(\d+)"[^>]*data-(?:invite|action|invite-actions|invitee)/i',
-            $body, $m
-        )) {
-            foreach ($m[1] as $aid) {
-                $aid = (int)$aid;
-                if ($aid > 0) $set[(string)(76561197960265728 + $aid)] = true;
-            }
-        }
-        return $set;
-    }
-
-    /**
-     * Собирает данные cookie-сессии для steamcommunity.com из access_token.
-     * sessionid генерируется локально; steamLoginSecure имеет формат
-     * "<steamid64>||<jwt access_token>" (URL-encoded), как у официального
-     * клиента / store.steampowered.com.
-     *
-     * @return array{sessionid:string,steam_login_secure:string,steamid:string}
-     */
-    private function buildCommunitySession(string $steamId, string $accessToken): array
-    {
-        return [
-            'sessionid'          => bin2hex(random_bytes(12)),
-            'steam_login_secure' => $steamId . '||' . $accessToken,
-            'steamid'            => $steamId,
-        ];
-    }
-
-    /** Строка cookie для steamcommunity.com. */
-    private function communityCookieHeader(array $session): string
-    {
-        return 'sessionid=' . $session['sessionid']
-             . '; steamLoginSecure=' . rawurlencode($session['steam_login_secure']);
-    }
-
-    /**
-     * POST https://steamcommunity.com/actions/AddFriendAjax
-     *  body: sessionID=<sid>&steamid=<target>&accept_invite=<0|1>
-     *  cookies: sessionid=<sid>; steamLoginSecure=<steamid>%7C%7C<jwt>
-     *
-     * accept_invite=0 — отправить новую заявку.
-     * accept_invite=1 — принять висящую входящую заявку от <target>.
-     *
-     * @return string один из: 'invite_sent' | 'accepted' | 'already_friends'
-     *                | 'pending' | 'rate_limited' | 'blocked'
-     *                | 'limit_exceeded' | 'access_denied' | 'failed'
-     *                | "community_error=N"
-     */
-    private function apiAddFriendCommunity(
-        array $session, string $targetSteamId, ?array $proxy, int $acceptInvite = 0
-    ): string {
-        $url     = 'https://steamcommunity.com/actions/AddFriendAjax';
-        $body    = http_build_query([
-            'sessionID'      => $session['sessionid'],
-            'steamid'        => $targetSteamId,
-            'accept_invite'  => (string)($acceptInvite ? 1 : 0),
-        ]);
-
-        $headers = [
-            'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
-            'Accept: application/json, text/plain, */*',
-            'X-Requested-With: XMLHttpRequest',
-            'Origin: https://steamcommunity.com',
-            'Referer: https://steamcommunity.com/profiles/' . $session['steamid'] . '/friends/',
-            'Cookie: ' . $this->communityCookieHeader($session),
-        ];
-
-        $resp = $this->httpRequest('POST', $url, $body, $proxy, $headers);
-
-        if ($resp['code'] === 401 || $resp['code'] === 403) return 'access_denied';
-        if ($resp['code'] === 429) return 'rate_limited';
-
-        $data = json_decode($resp['body'] ?: '', true);
-        if (!is_array($data)) return 'community_error=invalid_session';
-
-        if (!empty($data['success']) && empty($data['failed_invites'])) {
-            return $acceptInvite ? 'accepted' : 'invite_sent';
-        }
-
-        $codes = (array)($data['failed_invites_result'] ?? []);
-        $code  = isset($codes[0]) ? (int)$codes[0] : 0;
-
-        return match ($code) {
-            0   => 'failed',
-            11  => 'pending',
-            14  => 'already_friends',
-            15  => 'access_denied',
-            24  => 'rate_limited',
-            25  => 'limit_exceeded',
-            33  => 'pending',
-            40  => 'blocked',
-            41  => 'blocked',
-            84  => 'rate_limited',
-            default => "community_error={$code}",
-        };
-    }
-
 
     // =========================================================================
     // Проверка списка друзей
@@ -749,7 +907,15 @@ class SteamFriendManager
                 $t = trim($hline);
                 if ($t !== '' && strpos($t, ':') !== false) {
                     [$k, $v] = explode(':', $t, 2);
-                    $respHeaders[strtolower(trim($k))] = trim($v);
+                    $key = strtolower(trim($k));
+                    $val = trim($v);
+                    if ($key === 'set-cookie') {
+                        $respHeaders['set-cookie'] = isset($respHeaders['set-cookie'])
+                            ? array_merge((array)$respHeaders['set-cookie'], [$val])
+                            : [$val];
+                    } else {
+                        $respHeaders[$key] = $val;
+                    }
                 }
                 return $len;
             },
