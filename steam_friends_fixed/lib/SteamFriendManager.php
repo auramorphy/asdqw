@@ -692,15 +692,43 @@ class SteamFriendManager
             break;
         }
         $shortUrl = '';
-        if ($finalCode === 200 && $body !== ''
-            && preg_match('#https://s\.team/p/[a-z0-9\-]+#i', $body, $m)) {
-            $shortUrl = $m[0];
+        if ($finalCode === 200 && $body !== '') {
+            // 1) Прямой URL https://s.team/p/<short>
+            if (preg_match('#https?://s\.team/p/[a-z0-9\-]+#i', $body, $m)) {
+                $shortUrl = rtrim($m[0], '/');
+            }
+            // 2) JS-переменные с короткой частью (без https://s.team/p/),
+            //    например g_strFriendInvitePersonalLink или подобные.
+            if ($shortUrl === '' && preg_match_all(
+                    '/(?:friend.{0,10}invite|invite.{0,10}link|short[_]?url|personal[_]?link)[\'"\s:=]+[\'"]([a-z0-9\-\/:.]+)[\'"]/i',
+                    $body, $mm)) {
+                foreach ($mm[1] as $v) {
+                    if (stripos($v, 's.team/p/') !== false) {
+                        $shortUrl = preg_match('#https?://#', $v) ? rtrim($v, '/') : 'https://' . ltrim($v, '/');
+                        break;
+                    }
+                    if (preg_match('/^[a-z0-9\-]+$/i', $v) && strlen($v) >= 4 && strlen($v) <= 24
+                        && substr_count($v, '-') >= 1) {
+                        // Это похоже на short-prefix (например, drtv-mncr).
+                        $shortUrl = 'https://s.team/p/' . $v;
+                        break;
+                    }
+                }
+            }
+            // 3) data-shorturl="..." / data-invite-link="..."
+            if ($shortUrl === '' && preg_match('/data-(short[_-]?url|invite[_-]?link|personal[_-]?link)="([^"]+)"/i', $body, $m)) {
+                $v = $m[2];
+                if (stripos($v, 's.team/p/') !== false) {
+                    $shortUrl = preg_match('#https?://#', $v) ? rtrim($v, '/') : 'https://' . ltrim($v, '/');
+                }
+            }
         }
         $this->log(sprintf(
-            'apiFetchShortUrlFromFriendsAdd: HTTP %d url=%s shortUrl=%s',
+            'apiFetchShortUrlFromFriendsAdd: HTTP %d url=%s shortUrl=%s bodyLen=%d',
             $finalCode,
             preg_replace('#^https?://#', '', $finalUrl),
-            $shortUrl !== '' ? '<set>' : '<empty>'
+            $shortUrl !== '' ? '<set>' : '<empty>',
+            strlen($body)
         ));
         return $shortUrl;
     }
@@ -744,38 +772,46 @@ class SteamFriendManager
             throw new RuntimeException('non-JSON (HTTP ' . $resp['code'] . ')');
         }
 
-        // Достаём токен из всех известных мест.
-        $token = $data['invite_token']
-            ?? $data['data']['invite']['invite_token']
-            ?? $data['invite']['invite_token']
-            ?? '';
-        if (is_array($token)) $token = $token[0] ?? '';
-        if (!is_string($token)) $token = '';
+        // Рекурсивный сбор: токен (12-30 char [a-z0-9]) и ссылка (s.team/p/...).
+        $link  = '';
+        $token = '';
+        $keys  = []; // для диагностики
+        $walk = function ($node, string $path) use (&$walk, &$link, &$token, &$keys) {
+            if (is_array($node)) {
+                foreach ($node as $k => $v) $walk($v, $path === '' ? (string)$k : "$path.$k");
+                return;
+            }
+            if (!is_string($node) || $node === '') return;
+            $keys[] = $path;
 
-        // Иногда массив 'invite' сам содержит токен (например, "invite":["xxxx"]).
-        if ($token === '' && isset($data['invite']) && is_array($data['invite'])) {
-            $first = reset($data['invite']);
-            if (is_string($first) && $first !== '') $token = $first;
-        }
+            // Полная ссылка имеет вид https://s.team/p/<short>/<token>
+            if ($link === '' && preg_match('#https?://s\.team/p/[a-z0-9\-]+/[a-z0-9]+#i', $node, $m)) {
+                $link = $m[0];
+            }
+            // Токен — короткая [a-z0-9]+ строка (8-32 символа), без точек/слешей.
+            // Ловим только если поле выглядит «токенным» по имени.
+            if ($token === '' && preg_match('/(invite$|invite_token|^invite$|^invite\.0$|\.invite$|\.invite\.0$|^invite\.\d+$)/', $path)
+                && preg_match('/^[a-z0-9]{6,40}$/i', $node)) {
+                $token = $node;
+            }
+        };
+        $walk($data, '');
 
-        // Полная ссылка вида https://s.team/p/<short>/<token> может прийти под
-        // разными именами и тоже как массив.
-        $candidates = [
-            $data['invite_link']  ?? null,
-            $data['invite_url']   ?? null,
-            $data['data']['invite']['invite_link'] ?? null,
-            $data['data']['invite']['invite_url']  ?? null,
-        ];
-        $link = '';
-        foreach ($candidates as $c) {
-            if (is_array($c)) $c = $c[0] ?? null;
-            if (is_string($c) && stripos($c, 's.team/p/') !== false) { $link = $c; break; }
+        // Если ссылку нашли, но токена нет — извлекаем токен из самой ссылки.
+        if ($link !== '' && $token === '' && preg_match('#/p/[a-z0-9\-]+/([a-z0-9]+)#i', $link, $m)) {
+            $token = $m[1];
         }
 
         if ($token === '' && $link === '') {
-            $err = (string)($data['error'] ?? $data['msg'] ?? json_encode($data));
+            $sample = array_slice($keys, 0, 20);
+            $err = (string)($data['error'] ?? $data['msg'] ?? 'no token/link');
+            $this->log('apiCreateInviteToken: keys=' . implode(',', $sample)
+                     . ' raw=' . substr($resp['body'] ?: '', 0, 300));
             throw new RuntimeException($this->shortError($err));
         }
+        $this->log('apiCreateInviteToken: link='
+                 . ($link !== '' ? '<set>' : '<empty>')
+                 . ' token=' . ($token !== '' ? '<set>' : '<empty>'));
 
         return ['link' => $link, 'token' => $token];
     }
