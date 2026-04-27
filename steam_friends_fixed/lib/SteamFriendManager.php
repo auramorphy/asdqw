@@ -354,23 +354,33 @@ class SteamFriendManager
 
     /**
      * Добавить в друзья через Steam Web API.
+     *
+     * Важно: access_token идёт в query-string (а не в теле POST), плюс
+     * дублируется в заголовке Authorization: Bearer. format=json — чтобы
+     * получать JSON, а не protobuf-байты в ответе об ошибке (что и давало
+     * непарсимый "HTTP 400 body=?...KK?)N 0h?+" в логах).
      */
     private function apiAddFriend(string $accessToken, string $targetSteamId64): string
     {
-        $url = 'https://api.steampowered.com/IFriendsListService/AddFriend/v1/';
+        $url = 'https://api.steampowered.com/IFriendsListService/AddFriend/v1/?'
+             . http_build_query([
+                 'access_token' => $accessToken,
+                 'format'       => 'json',
+             ]);
         $body = http_build_query([
-            'access_token' => $accessToken,
-            'steamid'      => $targetSteamId64,
+            'steamid' => $targetSteamId64,
         ]);
 
-        $resp = $this->curlPost($url, $body);
+        $resp = $this->curlPost($url, $body, [
+            'Authorization: Bearer ' . $accessToken,
+        ]);
 
         $this->log("AddFriend {$targetSteamId64}: HTTP {$resp['code']} " . $this->safeLogBody($resp['body']));
 
-        if ($resp['code'] === 200) {
-            $data = json_decode($resp['body'], true);
-            $inner = $data['response'] ?? $data ?? [];
+        $data  = json_decode($resp['body'], true);
+        $inner = is_array($data) ? ($data['response'] ?? $data) : [];
 
+        if ($resp['code'] === 200) {
             if (isset($inner['friend_relationship'])) {
                 $rel = (int)$inner['friend_relationship'];
                 return match($rel) {
@@ -383,11 +393,13 @@ class SteamFriendManager
             return 'ok';
         }
 
-        if ($resp['code'] === 401) throw new RuntimeException('access_token невалиден (401)');
+        if ($resp['code'] === 401 || $resp['code'] === 403) {
+            throw new RuntimeException("access_token невалиден ({$resp['code']})");
+        }
 
-        $data = json_decode($resp['body'], true);
-        $eresult = $data['response']['eresult'] ?? $data['eresult'] ?? null;
-        if ($eresult !== null) {
+        // Steam often returns eresult в заголовке X-eresult
+        $eresult = $inner['eresult'] ?? ($resp['headers']['x-eresult'] ?? null);
+        if ($eresult !== null && $eresult !== '') {
             return match((int)$eresult) {
                 1  => 'ok',
                 14 => 'already_friends',
@@ -537,9 +549,10 @@ class SteamFriendManager
     }
 
     /** Простой POST для Steam Web API (AddFriend и т.п.). */
-    private function curlPost(string $url, string $body): array
+    private function curlPost(string $url, string $body, array $extraHeaders = []): array
     {
         $ch = curl_init($url);
+        $respHeaders = [];
         curl_setopt_array($ch, [
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => $body,
@@ -547,10 +560,19 @@ class SteamFriendManager
             CURLOPT_TIMEOUT        => 15,
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_USERAGENT      => self::UA,
-            CURLOPT_HTTPHEADER     => [
+            CURLOPT_HTTPHEADER     => array_merge([
                 'Content-Type: application/x-www-form-urlencoded',
                 'Accept: application/json',
-            ],
+            ], $extraHeaders),
+            CURLOPT_HEADERFUNCTION => function ($c, string $hline) use (&$respHeaders): int {
+                $len = strlen($hline);
+                $t = trim($hline);
+                if ($t !== '' && strpos($t, ':') !== false) {
+                    [$k, $v] = explode(':', $t, 2);
+                    $respHeaders[strtolower(trim($k))] = trim($v);
+                }
+                return $len;
+            },
         ]);
         $respBody = curl_exec($ch);
         $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -561,7 +583,7 @@ class SteamFriendManager
             throw new RuntimeException("cURL: {$err}");
         }
 
-        return ['code' => $httpCode, 'body' => (string)$respBody];
+        return ['code' => $httpCode, 'body' => (string)$respBody, 'headers' => $respHeaders];
     }
 
     // =========================================================================
