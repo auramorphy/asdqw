@@ -4,9 +4,16 @@ declare(strict_types=1);
 /**
  * SteamFriendManager — добавление Steam-аккаунтов чекеров в друзья друг к другу.
  *
- * Работает через Steam Web API (IFriendsListService) с access_token.
- * Авторизация реализована напрямую через Steam Auth protobuf API
- * (тот же поток, что и SteamStoreSession), без зависимости от SteamStoreSession.
+ * Используется официальный поток quick-invite-токенов (s.team/p/...):
+ *   1. Аккаунт логинится, получает access_token.
+ *   2. CreateFriendInviteToken (IUserAccountService) → личный invite_token,
+ *      хранится в logs/invite_tokens.json (только для внутренней логики,
+ *      нигде не выводится в UI и не пишется в человеческий лог).
+ *   3. Остальные аккаунты при логине вызывают RedeemFriendInviteToken
+ *      (IUserAccountService) с этим токеном — после чего пара становится
+ *      взаимными друзьями.
+ *
+ * Старый IFriendsListService/AddFriend/v1/ Steam удалил (HTTP 404 Not Found).
  *
  * Зависимости:
  *   - SteamProtobufCodec (protobuf encode/decode)
@@ -307,11 +314,15 @@ class SteamFriendManager
     }
 
     // =========================================================================
-    // Добавление в друзья через IFriendsListService/AddFriend
+    // Добавление в друзья через quick-invite-токены (IUserAccountService)
     // =========================================================================
 
     /**
-     * Залогиниться и добавить всех в друзья.
+     * Залогиниться, гарантировать наличие собственного quick-invite-токена,
+     * погасить токены остальных аккаунтов — это и есть «добавить в друзья».
+     *
+     * После одного полного прохода по всем аккаунтам все пары становятся
+     * взаимными друзьями (Steam friend-relationship симметричен).
      *
      * @param array $account Строка из steam_checker_accounts
      * @param string[] $targetSteamIds Список steamid64 всех аккаунтов
@@ -321,29 +332,68 @@ class SteamFriendManager
     public function addFriendsFromAccount(array $account, array $targetSteamIds, ?callable $onProgress = null): array
     {
         $results = ['sent' => [], 'errors' => []];
-        $login = $account['login'] ?? '?';
-        $ownSid = $account['steamid64'] ?? '';
+        $login   = $account['login'] ?? '?';
+        $ownSid  = $account['steamid64'] ?? '';
 
         try {
             $auth = $this->loginAndGetToken($account);
         } catch (Throwable $e) {
-            $results['errors'][] = ['target' => '*', 'error' => "Login: {$e->getMessage()}"];
+            $msg = $this->shortError($e->getMessage());
+            $results['errors'][] = ['target' => '*', 'error' => "login_failed: {$msg}"];
+            $this->log("addFriends {$login} steamId={$ownSid}: login_failed: {$msg}");
             return $results;
         }
 
-        $token = $auth['token'];
-        if ($onProgress) $onProgress("✅ {$login}: залогинен, steamId={$auth['steamId']}");
+        $token   = $auth['token'];
+        $proxy   = $this->loadProxyForAccount($account);
+        $loginSid = $auth['steamId'] ?: $ownSid;
 
+        // 1) гарантируем собственный invite_token (не логируем сам токен)
+        try {
+            $this->ensureOwnInviteToken($loginSid, $token, $proxy);
+        } catch (Throwable $e) {
+            $msg = $this->shortError($e->getMessage());
+            $results['errors'][] = ['target' => '*', 'error' => "create_invite_failed: {$msg}"];
+            $this->log("addFriends {$login} steamId={$loginSid}: create_invite_failed: {$msg}");
+            return $results;
+        }
+
+        if ($onProgress) $onProgress("✅ {$login}: залогинен (steamId={$loginSid})");
+
+        // 2) погашаем токены остальных аккаунтов
+        $tokens = $this->loadInviteTokens();
         foreach ($targetSteamIds as $targetSid) {
-            if ($targetSid === $ownSid) continue;
+            $targetSid = (string)$targetSid;
+            if ($targetSid === '' || $targetSid === $loginSid || $targetSid === $ownSid) continue;
+
+            $targetInvite = $tokens[$targetSid]['invite_token'] ?? null;
+            if (!$targetInvite) {
+                $results['sent'][] = ['target' => $targetSid, 'result' => 'no_invite_token'];
+                if ($onProgress) $onProgress("  · {$targetSid}: no_invite_token (будет добавлен на следующем проходе)");
+                continue;
+            }
 
             try {
-                $result = $this->apiAddFriend($token, $targetSid);
-                $results['sent'][] = ['target' => $targetSid, 'result' => $result];
-                if ($onProgress) $onProgress("  ✓ {$targetSid}: {$result}");
+                $status = $this->apiRedeemInvite($token, $targetSid, $targetInvite, $proxy);
+                if ($status === 'invite_expired' || $status === 'invalid_invite') {
+                    // Токен у цели больше не годен — выкидываем из кэша,
+                    // на следующем запуске цель создаст новый.
+                    $this->forgetInviteToken($targetSid);
+                }
+                if ($status === 'failed' || str_starts_with($status, 'eresult=')) {
+                    $results['errors'][] = ['target' => $targetSid, 'error' => $status];
+                    $this->log("addFriends {$login} → {$targetSid}: {$status}");
+                    if ($onProgress) $onProgress("  ✕ {$targetSid}: {$status}");
+                } else {
+                    $results['sent'][] = ['target' => $targetSid, 'result' => $status];
+                    $this->log("addFriends {$login} → {$targetSid}: {$status}");
+                    if ($onProgress) $onProgress("  ✓ {$targetSid}: {$status}");
+                }
             } catch (Throwable $e) {
-                $results['errors'][] = ['target' => $targetSid, 'error' => $e->getMessage()];
-                if ($onProgress) $onProgress("  ✕ {$targetSid}: {$e->getMessage()}");
+                $msg = $this->shortError($e->getMessage());
+                $results['errors'][] = ['target' => $targetSid, 'error' => $msg];
+                $this->log("addFriends {$login} → {$targetSid}: failed: {$msg}");
+                if ($onProgress) $onProgress("  ✕ {$targetSid}: {$msg}");
             }
 
             usleep(random_int(400_000, 1_200_000));
@@ -353,65 +403,118 @@ class SteamFriendManager
     }
 
     /**
-     * Добавить в друзья через Steam Web API.
-     *
-     * Важно: access_token идёт в query-string (а не в теле POST), плюс
-     * дублируется в заголовке Authorization: Bearer. format=json — чтобы
-     * получать JSON, а не protobuf-байты в ответе об ошибке (что и давало
-     * непарсимый "HTTP 400 body=?...KK?)N 0h?+" в логах).
+     * Создать (или переиспользовать существующий) собственный quick-invite-токен
+     * для указанного steamid. Возвращает токен. Никуда не логируется и не выводится.
      */
-    private function apiAddFriend(string $accessToken, string $targetSteamId64): string
+    private function ensureOwnInviteToken(string $ownSteamid, string $accessToken, ?array $proxy): string
     {
-        $url = 'https://api.steampowered.com/IFriendsListService/AddFriend/v1/?'
-             . http_build_query([
-                 'access_token' => $accessToken,
-                 'format'       => 'json',
-             ]);
-        $body = http_build_query([
-            'steamid' => $targetSteamId64,
+        $tokens = $this->loadInviteTokens();
+        $cached = $tokens[$ownSteamid]['invite_token'] ?? null;
+        if (is_string($cached) && $cached !== '') {
+            return $cached;
+        }
+
+        $created = $this->apiCreateInviteToken($accessToken, $proxy);
+        $invite  = (string)($created['invite_token'] ?? '');
+        if ($invite === '') {
+            throw new RuntimeException('CreateFriendInviteToken: пустой invite_token в ответе');
+        }
+
+        $this->saveInviteToken($ownSteamid, $invite, [
+            'time_created' => $created['time_created'] ?? time(),
+            'invite_limit' => $created['invite_limit'] ?? null,
+            'valid'        => $created['valid'] ?? true,
         ]);
+        return $invite;
+    }
 
-        $resp = $this->curlPost($url, $body, [
-            'Authorization: Bearer ' . $accessToken,
-        ]);
+    /**
+     * IUserAccountService/CreateFriendInviteToken/v1/
+     *
+     * @return array{invite_token:string,invite_limit:?int,invite_duration:?int,time_created:?int,valid:?bool}
+     */
+    private function apiCreateInviteToken(string $accessToken, ?array $proxy): array
+    {
+        // CUserAccount_CreateFriendInviteToken_Request:
+        //   uint32 invite_limit = 1; uint32 invite_duration = 2; string invite_note = 3;
+        // Все поля optional → отправляем пустое тело, Steam ставит дефолты.
+        $proto = '';
 
-        $this->log("AddFriend {$targetSteamId64}: HTTP {$resp['code']} " . $this->safeLogBody($resp['body']));
+        $url = 'https://api.steampowered.com/IUserAccountService/CreateFriendInviteToken/v1/?'
+             . http_build_query(['access_token' => $accessToken]);
 
-        $data  = json_decode($resp['body'], true);
-        $inner = is_array($data) ? ($data['response'] ?? $data) : [];
+        $resp = $this->postProtobuf($url, $proto, $proxy);
 
-        if ($resp['code'] === 200) {
-            if (isset($inner['friend_relationship'])) {
-                $rel = (int)$inner['friend_relationship'];
-                return match($rel) {
-                    2 => 'already_friends',
-                    3 => 'invite_sent',
-                    default => "ok (rel={$rel})",
-                };
-            }
-            if (!empty($inner['invite_sent'])) return 'invite_sent';
-            return 'ok';
+        if ($resp['code'] !== 200) {
+            $eresult = $resp['headers']['x-eresult'] ?? '';
+            throw new RuntimeException("CreateFriendInviteToken: HTTP {$resp['code']}"
+                . ($eresult !== '' ? " eresult={$eresult}" : ''));
         }
 
-        if ($resp['code'] === 401 || $resp['code'] === 403) {
-            throw new RuntimeException("access_token невалиден ({$resp['code']})");
+        $decoded = SteamProtobufCodec::decode($resp['body']);
+        return [
+            'invite_token'    => isset($decoded[1]) && is_string($decoded[1]) ? $decoded[1] : '',
+            'invite_limit'    => isset($decoded[2]) ? (int)$decoded[2] : null,
+            'invite_duration' => isset($decoded[3]) ? (int)$decoded[3] : null,
+            'time_created'    => isset($decoded[4]) ? (int)$decoded[4] : null,
+            'valid'           => isset($decoded[5]) ? (bool)$decoded[5] : null,
+        ];
+    }
+
+    /**
+     * IUserAccountService/RedeemFriendInviteToken/v1/
+     *
+     * @return string один из: 'invite_redeemed' | 'already_friends' | 'invite_expired'
+     *                | 'invalid_invite' | 'rate_limited' | 'failed' | "eresult=N"
+     */
+    private function apiRedeemInvite(string $accessToken, string $ownerSteamid, string $inviteToken, ?array $proxy): string
+    {
+        // CUserAccount_RedeemFriendInviteToken_Request:
+        //   fixed64 steamid = 1; string invite_token = 2;
+        $proto  = self::encodeFixed64(1, $ownerSteamid);
+        $proto .= SteamProtobufCodec::encodeString(2, $inviteToken);
+
+        $url = 'https://api.steampowered.com/IUserAccountService/RedeemFriendInviteToken/v1/?'
+             . http_build_query(['access_token' => $accessToken]);
+
+        $resp    = $this->postProtobuf($url, $proto, $proxy);
+        $eresult = $resp['headers']['x-eresult'] ?? '';
+
+        if ($resp['code'] === 200 && ($eresult === '' || $eresult === '1')) {
+            return 'invite_redeemed';
         }
 
-        // Steam often returns eresult в заголовке X-eresult
-        $eresult = $inner['eresult'] ?? ($resp['headers']['x-eresult'] ?? null);
-        if ($eresult !== null && $eresult !== '') {
-            return match((int)$eresult) {
-                1  => 'ok',
-                14 => 'already_friends',
-                24 => 'rate_limited',
-                25 => 'invite_already_sent',
-                40 => 'blocked',
-                84 => 'limit_exceeded',
-                default => "eresult={$eresult}",
-            };
-        }
+        // Распознаваемые eresult из практики Steam Web API
+        $er = (int)$eresult;
+        return match ($er) {
+            1   => 'invite_redeemed',
+            2   => 'failed',                  // Generic Fail
+            10  => 'invalid_invite',          // BadResponse / token не существует
+            11  => 'invalid_invite',          // InvalidParam (часто = плохой токен)
+            13  => 'invalid_invite',          // InvalidPassword (для invite — невалиден)
+            15  => 'access_denied',
+            24  => 'rate_limited',
+            25  => 'rate_limited',            // LimitExceeded
+            33  => 'already_friends',         // DuplicateRequest — уже друзья / уже погашен
+            41  => 'invite_expired',
+            50  => 'already_friends',
+            84  => 'rate_limited',
+            default => $eresult !== '' ? "eresult={$eresult}" : "failed",
+        };
+    }
 
-        throw new RuntimeException("HTTP {$resp['code']}: " . $this->safeLogBody($resp['body']));
+    /**
+     * Внутренняя ссылка вида https://s.team/p/<invite_token>.
+     * Используется ТОЛЬКО логикой; в UI/логи не попадает.
+     */
+    public function getQuickInviteLink(array $account): ?string
+    {
+        $sid = (string)($account['steamid64'] ?? '');
+        if ($sid === '') return null;
+        $auth   = $this->loginAndGetToken($account);
+        $proxy  = $this->loadProxyForAccount($account);
+        $token  = $this->ensureOwnInviteToken($auth['steamId'] ?: $sid, $auth['token'], $proxy);
+        return 'https://s.team/p/' . $token;
     }
 
     // =========================================================================
@@ -674,6 +777,13 @@ class SteamFriendManager
         $this->cryptoLoaded = class_exists('SteamCrypto', false);
     }
 
+    /** Прокси из аккаунта или null. */
+    private function loadProxyForAccount(array $account): ?array
+    {
+        if (empty($account['proxy_id']) || !$this->pdo) return null;
+        return $this->loadProxy((int)$account['proxy_id']);
+    }
+
     private function loadProxy(int $proxyId): ?array
     {
         if (!$this->pdo) return null;
@@ -693,6 +803,74 @@ class SteamFriendManager
     }
 
     // =========================================================================
+    // Кэш invite-токенов (приватно, не попадает в UI)
+    // =========================================================================
+
+    private function inviteTokensFile(): string
+    {
+        return $this->logDir . '/invite_tokens.json';
+    }
+
+    /** @return array<string, array{invite_token:string,time_created?:int,invite_limit?:int,valid?:bool}> */
+    private function loadInviteTokens(): array
+    {
+        $f = $this->inviteTokensFile();
+        if (!is_file($f)) return [];
+        $raw = @file_get_contents($f);
+        if ($raw === false || $raw === '') return [];
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : [];
+    }
+
+    private function saveInviteToken(string $steamid, string $inviteToken, array $meta = []): void
+    {
+        $tokens = $this->loadInviteTokens();
+        $tokens[$steamid] = array_merge(
+            ['invite_token' => $inviteToken, 'saved_at' => date('Y-m-d H:i:s')],
+            $meta
+        );
+        $f = $this->inviteTokensFile();
+        @file_put_contents(
+            $f,
+            json_encode($tokens, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+            LOCK_EX
+        );
+        @chmod($f, 0600);
+    }
+
+    private function forgetInviteToken(string $steamid): void
+    {
+        $tokens = $this->loadInviteTokens();
+        if (!isset($tokens[$steamid])) return;
+        unset($tokens[$steamid]);
+        $f = $this->inviteTokensFile();
+        @file_put_contents(
+            $f,
+            json_encode($tokens, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+            LOCK_EX
+        );
+        @chmod($f, 0600);
+    }
+
+    // =========================================================================
+    // Protobuf helpers
+    // =========================================================================
+
+    /**
+     * Кодирование fixed64 (wire-type 1, 8 байт little-endian).
+     * SteamProtobufCodec в проекте не имеет fixed64-хелпера, но он нужен
+     * для steamid в RedeemFriendInviteToken_Request.
+     */
+    private static function encodeFixed64(int $field, string $value): string
+    {
+        $tag  = chr(($field << 3) | 1);
+        $val  = (int)$value; // steamid64 ≈ 7.6e16, помещается в 64-bit PHP int
+        $low  = $val & 0xFFFFFFFF;
+        $high = ($val >> 32) & 0xFFFFFFFF;
+        return $tag . pack('VV', $low, $high);
+    }
+
+    // =========================================================================
     // Logging
     // =========================================================================
 
@@ -702,9 +880,29 @@ class SteamFriendManager
         if ($body === '') return '(empty)';
         if (json_decode($body, true) !== null) return mb_substr($body, 0, $maxLen);
         if (preg_match('/[^\x20-\x7E\r\n\t]/', $body)) {
-            return '(binary ' . strlen($body) . 'b) hex=' . bin2hex(substr($body, 0, 40));
+            return '(binary ' . strlen($body) . 'b)';
         }
         return mb_substr($body, 0, $maxLen);
+    }
+
+    /**
+     * Свести любую ошибку к короткой однострочной форме без HTML/бинарных
+     * хвостов. Используется и в логе, и в ответе API.
+     */
+    private function shortError(string $msg): string
+    {
+        $msg = trim($msg);
+        // Срезаем HTML-страницы целиком: «<html…»
+        if (preg_match('~^(.*?)<\s*/?\s*html\b~is', $msg, $m)) {
+            $msg = trim($m[1]);
+        }
+        // Убираем повторяющиеся пробелы и переводы строк
+        $msg = preg_replace('/\s+/', ' ', $msg);
+        // Ограничиваем длину
+        if (mb_strlen($msg) > 160) {
+            $msg = mb_substr($msg, 0, 160) . '…';
+        }
+        return $msg !== '' ? $msg : 'unknown error';
     }
 
     private function log(string $msg): void

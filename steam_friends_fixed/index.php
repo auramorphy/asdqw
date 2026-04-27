@@ -82,15 +82,6 @@ $totalActive = count($active);
 
         .actions-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
         .spacer{flex:1}
-
-        .quick-link-cell{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
-        .quick-link{color:#4fc3f7;text-decoration:none;font-size:.82em;font-family:'Cascadia Code','Fira Code',monospace}
-        .quick-link:hover{text-decoration:underline}
-        .btn-copy{background:#2a2e36;color:#4fc3f7;border:1px solid #444;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:.85em;line-height:1;transition:all .12s}
-        .btn-copy:hover{background:#37424d;border-color:#4fc3f7}
-        .btn-copy.copied{background:#1b5e20;border-color:#1b5e20;color:#fff}
-        #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1b5e20;color:#fff;padding:10px 18px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.4);font-size:.9em;opacity:0;pointer-events:none;transition:opacity .2s;z-index:1000}
-        #toast.show{opacity:1}
     </style>
 </head>
 <body>
@@ -104,17 +95,12 @@ $totalActive = count($active);
     <div class="card info-box">
         <p style="font-size:.86em;color:#90caf9">
             <strong>Как это работает:</strong> Для каждого аккаунта система логинится через Steam,
-            отправляет заявки в друзья всем остальным и принимает входящие.
-            <br>
-            <strong>Быстрая ссылка:</strong> в столбце «Быстрая ссылка» — прямой URL вида
-            <code>steamcommunity.com/profiles/&lt;steamid64&gt;/friends/add</code>.
-            Открой её в браузере под любым своим Steam-аккаунтом — получишь кнопку «Добавить в друзья»
-            на нужного чекера. Кнопка <code>📋</code> копирует одну ссылку, кнопка
-            <code>🔗 Скопировать все ссылки</code> — все сразу.
+            создаёт у себя <em>quick-invite-токен</em> и автоматически погашает токены остальных
+            аккаунтов — это даёт обоюдную дружбу без ручных ссылок и без 404 в логах.
             <br>
             <strong>Требования:</strong>
             • Заполнен <code>steamid64</code> и <code>пароль</code>
-            • Без Steam Guard / 2FA (только для авто-добавления)
+            • Без Steam Guard / 2FA
         </p>
     </div>
 
@@ -144,9 +130,6 @@ $totalActive = count($active);
             <button class="btn btn-primary btn-sm" onclick="checkAllFriends()" id="btn-check">
                 🔍 Проверить друзей
             </button>
-            <button class="btn btn-primary btn-sm" onclick="copyAllQuickLinks()" id="btn-copy-all" title="Скопировать ссылки /friends/add для всех активных аккаунтов">
-                🔗 Скопировать все ссылки
-            </button>
             <button class="btn btn-success" onclick="startAddFriends(false)" id="btn-start">
                 ➕ Добавить всех в друзья
             </button>
@@ -161,14 +144,13 @@ $totalActive = count($active);
         <table>
             <thead><tr>
                 <th style="width:30px"></th>
-                <th>ID</th><th>Регион</th><th>Логин</th><th>SteamID64</th><th>Друзья</th><th>Быстрая ссылка</th><th>Статус</th>
+                <th>ID</th><th>Регион</th><th>Логин</th><th>SteamID64</th><th>Друзья</th><th>Статус</th>
             </tr></thead>
             <tbody>
             <?php foreach($accounts as $acc):
                 $hasSid = !empty($acc['steamid64']);
                 $ready  = $acc['is_active'] && $hasSid;
                 $sid    = $acc['steamid64'] ?? '';
-                $quickLink = $hasSid ? "https://steamcommunity.com/profiles/{$sid}/friends/add" : '';
 
                 // Из кэша
                 $cached = $friendCache[$sid] ?? null;
@@ -200,16 +182,6 @@ $totalActive = count($active);
                             ?>
                         </span>
                     </td>
-                    <td>
-                        <?php if ($hasSid): ?>
-                            <span class="quick-link-cell">
-                                <a class="quick-link" href="<?=htmlspecialchars($quickLink)?>" target="_blank" rel="noopener" title="<?=htmlspecialchars($quickLink)?>">/friends/add ↗</a>
-                                <button type="button" class="btn-copy" onclick="copyQuickLink(this, '<?=htmlspecialchars($quickLink, ENT_QUOTES)?>')" title="Скопировать ссылку">📋</button>
-                            </span>
-                        <?php else: ?>
-                            <span style="color:#666">—</span>
-                        <?php endif; ?>
-                    </td>
                     <td><?php
                         if ($ready) echo '<span class="tag tag-a">OK</span>';
                         elseif (!$acc['is_active']) echo '<span class="tag tag-i">OFF</span>';
@@ -230,8 +202,6 @@ $totalActive = count($active);
     </div>
 </div>
 
-<div id="toast"></div>
-
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -239,58 +209,6 @@ const $$ = s => [...document.querySelectorAll(s)];
 // Все steamid64 активных аккаунтов
 const ALL_STEAM_IDS = <?=json_encode(array_values($activeSteamIds))?>;
 const TOTAL_ACTIVE = <?=$totalActive?>;
-
-// ===== Быстрые ссылки на добавление в друзья =====
-function showToast(text, ok) {
-    const t = $('#toast');
-    t.textContent = text;
-    t.style.background = ok === false ? '#b71c1c' : '#1b5e20';
-    t.classList.add('show');
-    clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => t.classList.remove('show'), 1800);
-}
-
-async function copyToClipboard(text) {
-    try {
-        if (navigator.clipboard && window.isSecureContext) {
-            await navigator.clipboard.writeText(text);
-            return true;
-        }
-    } catch (e) { /* fallback ниже */ }
-    // Fallback для http и старых браузеров
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.select();
-    let ok = false;
-    try { ok = document.execCommand('copy'); } catch (e) {}
-    document.body.removeChild(ta);
-    return ok;
-}
-
-async function copyQuickLink(btn, link) {
-    const ok = await copyToClipboard(link);
-    if (ok) {
-        const orig = btn.textContent;
-        btn.classList.add('copied');
-        btn.textContent = '✓';
-        setTimeout(() => { btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
-        showToast('Ссылка скопирована');
-    } else {
-        showToast('Не удалось скопировать', false);
-    }
-}
-
-async function copyAllQuickLinks() {
-    const links = $$('tr[data-sid]')
-        .filter(tr => tr.dataset.sid)
-        .map(tr => 'https://steamcommunity.com/profiles/' + tr.dataset.sid + '/friends/add');
-    if (!links.length) { showToast('Нет аккаунтов с steamid64', false); return; }
-    const ok = await copyToClipboard(links.join('\n'));
-    showToast(ok ? ('Скопировано ' + links.length + ' ссылок') : 'Не удалось скопировать', ok);
-}
 
 $('#select-all').addEventListener('change', function() {
     $$('.acc-chk:not(:disabled)').forEach(c => c.checked = this.checked);
