@@ -730,6 +730,17 @@ class SteamFriendManager
             $shortUrl !== '' ? '<set>' : '<empty>',
             strlen($body)
         ));
+        // Одноразовая отладка: если shortUrl не нашли, сохраняем HTML страницы,
+        // чтобы вручную найти где Steam её прячет. Делается ровно один раз
+        // (если файл уже есть — не перезаписываем).
+        if ($shortUrl === '' && $body !== '' && $finalCode === 200) {
+            $sid = $session['steamid'] ?? 'unknown';
+            $dumpPath = $this->logDir . '/debug_friends_add_' . $sid . '.html';
+            if (!file_exists($dumpPath)) {
+                @file_put_contents($dumpPath, $body);
+                $this->log("debug dump saved: " . basename($dumpPath));
+            }
+        }
         return $shortUrl;
     }
 
