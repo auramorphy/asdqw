@@ -398,6 +398,7 @@ class SteamFriendManager
             throw new RuntimeException('finalizelogin: нет transfer_info в ответе');
         }
         $out = [];
+        $hosts = [];
         foreach ($data['transfer_info'] as $ti) {
             $url    = (string)($ti['url'] ?? '');
             $params = $ti['params'] ?? [];
@@ -407,8 +408,11 @@ class SteamFriendManager
                 'nonce' => (string)($params['nonce'] ?? ''),
                 'auth'  => (string)($params['auth'] ?? ''),
             ];
+            $h = parse_url($url, PHP_URL_HOST);
+            if ($h) $hosts[] = $h;
         }
         if (!$out) throw new RuntimeException('finalizelogin: transfer_info пуст после разбора');
+        $this->log('finalizelogin: ' . count($out) . ' transfer entries: ' . implode(', ', $hosts));
         return $out;
     }
 
@@ -436,17 +440,32 @@ class SteamFriendManager
                 'Origin: https://store.steampowered.com',
                 'Referer: https://store.steampowered.com/',
             ]);
-            if ($resp['code'] < 200 || $resp['code'] >= 300) {
+            // settoken отвечает либо 200 JSON {"result":1}, либо 302-редиректом —
+            // в обоих вариантах нужная нам Set-Cookie steamLoginSecure ставится.
+            // Категорически отбрасываем только 4xx/5xx.
+            if ($resp['code'] >= 400) {
                 throw new RuntimeException("settoken {$domainContains}: HTTP {$resp['code']}");
             }
             $cookies = $resp['headers']['set-cookie'] ?? [];
             if (!is_array($cookies)) $cookies = [$cookies];
+            // Берём ПОСЛЕДНИЙ steamLoginSecure с реальным значением (содержащим ||).
+            // Steam часто шлёт сначала "steamLoginSecure=deleted" чтобы сбросить старое,
+            // потом настоящее значение — берём настоящее.
+            $found = '';
             foreach ($cookies as $c) {
                 if (preg_match('/^steamLoginSecure=([^;]+)/i', $c, $m)) {
-                    return $m[1]; // уже URL-encoded — кладём как есть в Cookie header
+                    $val = $m[1];
+                    $decoded = urldecode($val);
+                    if (str_contains($decoded, '||')) {
+                        $found = $val; // URL-encoded, как пришло
+                    }
                 }
             }
-            throw new RuntimeException("settoken {$domainContains}: нет steamLoginSecure в Set-Cookie");
+            if ($found !== '') return $found;
+            throw new RuntimeException(
+                "settoken {$domainContains}: нет валидной steamLoginSecure (HTTP {$resp['code']}, "
+                . count($cookies) . " cookies)"
+            );
         }
         throw new RuntimeException("finalizelogin: нет transfer_info для {$domainContains}");
     }
@@ -647,29 +666,55 @@ class SteamFriendManager
      */
     private function apiFetchOwnShortUrl(array $session, ?array $proxy): string
     {
-        $resp = $this->httpRequest('GET', 'https://steamcommunity.com/my/', null, $proxy, [
-            'Accept: text/html,*/*',
-            'Cookie: ' . $this->communityCookieHeader($session),
-        ]);
-        // /my/ редиректит на /profiles/<id>/, нам важен любой ответ с data-userinfo
-        if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
-            $loc = $resp['headers']['location'];
-            if ($loc[0] === '/') $loc = 'https://steamcommunity.com' . $loc;
-            $resp = $this->httpRequest('GET', $loc, null, $proxy, [
-                'Accept: text/html,*/*',
-                'Cookie: ' . $this->communityCookieHeader($session),
-            ]);
-        }
-        if ($resp['code'] !== 200 || $resp['body'] === '') return '';
+        $url = 'https://steamcommunity.com/my/';
+        $cookie = $this->communityCookieHeader($session);
+        $finalCode = 0;
+        $finalUrl  = $url;
+        $finalBody = '';
 
-        if (preg_match('/data-userinfo="([^"]+)"/', $resp['body'], $m)) {
-            $json = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
-            $info = json_decode($json, true);
-            if (is_array($info) && !empty($info['short_url'])) {
-                return (string)$info['short_url'];
+        // /my/ может редиректить 2-3 раза: /my/ → /profiles/<sid>/ или /id/<vanity>/
+        for ($i = 0; $i < 5; $i++) {
+            $resp = $this->httpRequest('GET', $finalUrl, null, $proxy, [
+                'Accept: text/html,application/xhtml+xml,*/*',
+                'Cookie: ' . $cookie,
+            ]);
+            $finalCode = $resp['code'];
+            $finalBody = $resp['body'];
+            if ($resp['code'] >= 300 && $resp['code'] < 400 && !empty($resp['headers']['location'])) {
+                $loc = $resp['headers']['location'];
+                if ($loc[0] === '/') $loc = 'https://steamcommunity.com' . $loc;
+                $finalUrl = $loc;
+                continue;
+            }
+            break;
+        }
+
+        // Если в финале мы на /login/, значит cookie не принята.
+        $isLogin = str_contains($finalUrl, '/login/');
+        $hasUserInfo = false;
+        $shortUrl = '';
+
+        if (!$isLogin && $finalCode === 200 && $finalBody !== '') {
+            if (preg_match('/data-userinfo="([^"]+)"/', $finalBody, $m)) {
+                $hasUserInfo = true;
+                $json = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
+                $info = json_decode($json, true);
+                if (is_array($info) && !empty($info['short_url'])) {
+                    $shortUrl = (string)$info['short_url'];
+                }
             }
         }
-        return '';
+
+        $this->log(sprintf(
+            'apiFetchOwnShortUrl: final HTTP %d url=%s isLogin=%d hasUserInfo=%d shortUrl=%s',
+            $finalCode,
+            preg_replace('#^https?://#', '', $finalUrl),
+            $isLogin ? 1 : 0,
+            $hasUserInfo ? 1 : 0,
+            $shortUrl !== '' ? '<set>' : '<empty>'
+        ));
+
+        return $shortUrl;
     }
 
     /**
