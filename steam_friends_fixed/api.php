@@ -103,6 +103,7 @@ if ($action === 'add_one') {
     $result = $manager->addFriendsFromAccount(
         $account,
         $targetIds,
+        $accounts, // все активные аккаунты — нужны, чтобы залогинить B и redeem'нуть quick-invite
         function (string $msg) use (&$log) {
             $log[] = $msg;
         }
